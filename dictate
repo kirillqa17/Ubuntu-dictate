@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
 dictate-ru — offline голосовая диктовка на русском языке для Linux.
-Использует Vosk (offline STT) + PulseAudio (parec) + wl-copy (Wayland clipboard).
-
 Usage:
   dictate        — говори, по Ctrl+C выводит текст и копирует в буфер обмена
-  dictate --no-copy  — только вывод в stdout, без копирования в буфер
+  dictate --no-copy  — только вывод в stdout
 """
 import subprocess
 import sys
 import json
 import signal
 import os
+import shutil
+import re
 import argparse
 
 DEFAULT_MODEL = "vosk-model-small-ru-0.22"
@@ -19,11 +19,8 @@ MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip"
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 8000
 
-os.environ["VOSK_LOG_LEVEL"] = "-1"
-
 
 def get_model_path():
-    """Find model in standard locations."""
     candidates = [
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "model"),
         os.path.expanduser(f"~/.local/share/vosk-models/{DEFAULT_MODEL}"),
@@ -35,45 +32,53 @@ def get_model_path():
     return None
 
 
-def download_model(dest_dir):
-    """Download and extract the Russian model."""
-    import zipfile
-    import urllib.request
-
-    zip_path = os.path.join(dest_dir, "model.zip")
-    print(f"Скачиваю модель ({DEFAULT_MODEL})...", file=sys.stderr, flush=True)
-
-    urllib.request.urlretrieve(MODEL_URL, zip_path)
-
-    print("Распаковываю...", file=sys.stderr, flush=True)
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(dest_dir)
-    os.remove(zip_path)
-
-    extracted = os.path.join(dest_dir, DEFAULT_MODEL)
-    model_link = os.path.join(dest_dir, "model")
-    if os.path.isdir(extracted) and not os.path.exists(model_link):
-        os.symlink(extracted, model_link)
-
-    return extracted
+def get_term_width():
+    try:
+        return shutil.get_terminal_size().columns
+    except Exception:
+        return 80
 
 
-def check_dependencies():
-    """Check that required system tools are available."""
-    missing = []
-    for cmd in ["parec"]:
-        if not any(
-            os.access(os.path.join(p, cmd), os.X_OK)
-            for p in os.environ.get("PATH", "").split(":")
-        ):
-            missing.append(cmd)
-    if missing:
-        print(
-            f"Не найдены: {', '.join(missing)}\n"
-            f"Установи: sudo apt install pulseaudio-utils",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+def clear_line():
+    """Clear current line using ANSI escape."""
+    sys.stderr.write("\033[2K\r")
+    sys.stderr.flush()
+
+
+def show_preview(text):
+    """Show truncated preview that fits in one terminal line."""
+    width = get_term_width() - 4
+    display = text[:width] if len(text) > width else text
+    clear_line()
+    sys.stderr.write(f"  {display}")
+    sys.stderr.flush()
+
+
+def punctuate(text):
+    """Add basic punctuation to raw vosk output."""
+    if not text:
+        return text
+    # Capitalize first letter
+    text = text[0].upper() + text[1:]
+    # Add period at the end if no punctuation
+    if text and text[-1] not in ".!?":
+        text += "."
+    # Capitalize after sentence markers (keywords that usually start new sentences)
+    sentence_starters = [
+        "во-первых", "во-вторых", "в-третьих", "потом", "затем",
+        "также", "ещё", "далее", "кроме того", "наконец",
+    ]
+    for word in sentence_starters:
+        pattern = rf"(\S)\s+({word})"
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            text = re.sub(
+                pattern,
+                lambda m: f"{m.group(1)}. {m.group(2)[0].upper()}{m.group(2)[1:]}",
+                text,
+                flags=re.IGNORECASE,
+            )
+    return text
 
 
 def has_wl_copy():
@@ -86,34 +91,37 @@ def has_wl_copy():
 def main():
     parser = argparse.ArgumentParser(description="Offline голосовая диктовка на русском")
     parser.add_argument("--no-copy", action="store_true", help="Не копировать в буфер обмена")
+    parser.add_argument("--no-punct", action="store_true", help="Без автопунктуации")
     parser.add_argument("--model", type=str, help="Путь к Vosk модели")
     args = parser.parse_args()
 
-    check_dependencies()
-
     try:
-        from vosk import Model, KaldiRecognizer
+        from vosk import Model, KaldiRecognizer, SetLogLevel
     except ImportError:
         print("Vosk не установлен. Установи: pip install vosk", file=sys.stderr)
         sys.exit(1)
 
+    SetLogLevel(-1)
+
     model_path = args.model or get_model_path()
     if not model_path:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        model_path = download_model(script_dir)
+        print(f"Модель не найдена. Скачай: wget {MODEL_URL}", file=sys.stderr)
+        sys.exit(1)
 
-    print("Загрузка...", end="", file=sys.stderr, flush=True)
+    sys.stderr.write("Загрузка...")
+    sys.stderr.flush()
     model = Model(model_path)
     rec = KaldiRecognizer(model, SAMPLE_RATE)
-    print(" Говори! (Ctrl+C — готово)", file=sys.stderr, flush=True)
+    sys.stderr.write(" Говори! (Ctrl+C — готово)\n")
+    sys.stderr.flush()
 
     proc = subprocess.Popen(
         ["parec", "--format=s16le", f"--rate={SAMPLE_RATE}", "--channels=1", "--latency-msec=100"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
 
     copy_to_clipboard = not args.no_copy and has_wl_copy()
+    use_punct = not args.no_punct
     all_text = []
 
     def on_exit(sig, frame):
@@ -122,14 +130,16 @@ def main():
         final = json.loads(rec.FinalResult())
         if final.get("text"):
             all_text.append(final["text"])
-        text = " ".join(all_text)
+        raw = " ".join(all_text)
+        text = punctuate(raw) if use_punct else raw
+        clear_line()
         if text:
-            print(f"\n{text}", flush=True)
+            print(text, flush=True)
             if copy_to_clipboard:
                 subprocess.run(["wl-copy", text], check=False)
-                print("(скопировано в буфер)", file=sys.stderr)
+                sys.stderr.write("(скопировано в буфер)\n")
         else:
-            print("\n(ничего не распознано)", file=sys.stderr)
+            sys.stderr.write("(ничего не распознано)\n")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, on_exit)
@@ -145,13 +155,13 @@ def main():
             text = result.get("text", "")
             if text:
                 all_text.append(text)
-                print(f"\r  {' '.join(all_text)}", end="", file=sys.stderr, flush=True)
+                show_preview(" ".join(all_text))
         else:
             partial = json.loads(rec.PartialResult())
             ptext = partial.get("partial", "")
             if ptext:
                 preview = " ".join(all_text + [ptext]) if all_text else ptext
-                print(f"\r  {preview}   ", end="", file=sys.stderr, flush=True)
+                show_preview(preview)
 
 
 if __name__ == "__main__":
