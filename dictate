@@ -22,9 +22,9 @@ CHUNK_SIZE = 8000
 
 def get_model_path():
     candidates = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "model"),
+        os.path.join(os.path.dirname(os.path.realpath(__file__)), "model"),
         os.path.expanduser(f"~/.local/share/vosk-models/{DEFAULT_MODEL}"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), DEFAULT_MODEL),
+        os.path.join(os.path.dirname(os.path.realpath(__file__)), DEFAULT_MODEL),
     ]
     for path in candidates:
         if os.path.isdir(path) and os.path.isdir(os.path.join(path, "graph")):
@@ -39,45 +39,84 @@ def get_term_width():
         return 80
 
 
-def clear_line():
-    """Clear current line using ANSI escape."""
-    sys.stderr.write("\033[2K\r")
-    sys.stderr.flush()
+# Track how many lines the previous preview occupied
+_prev_lines = 0
 
 
 def show_preview(text):
-    """Show truncated preview that fits in one terminal line."""
-    width = get_term_width() - 4
-    display = text[:width] if len(text) > width else text
-    clear_line()
-    sys.stderr.write(f"  {display}")
+    """Show preview, clearing all previously written lines first."""
+    global _prev_lines
+    width = get_term_width()
+
+    # Move up and clear each line from previous preview
+    for _ in range(_prev_lines):
+        sys.stderr.write("\033[A\033[2K")
+    sys.stderr.write("\r\033[2K")
+
+    # Truncate to show only last `width - 2` chars (with … prefix if truncated)
+    display = text
+    max_chars = width - 2
+    if len(display) > max_chars:
+        display = "…" + display[-(max_chars - 1):]
+
+    sys.stderr.write(f" {display}")
     sys.stderr.flush()
+
+    # Calculate how many lines this output occupies (0 = fits in one line)
+    _prev_lines = len(f" {display}") // width
 
 
 def punctuate(text):
-    """Add basic punctuation to raw vosk output."""
+    """Add punctuation to raw vosk output."""
     if not text:
         return text
-    # Capitalize first letter
-    text = text[0].upper() + text[1:]
-    # Add period at the end if no punctuation
-    if text and text[-1] not in ".!?":
-        text += "."
-    # Capitalize after sentence markers (keywords that usually start new sentences)
+
+    # Words before which a comma is usually placed
+    comma_words = [
+        "что", "чтобы", "который", "которая", "которое", "которые",
+        "потому что", "так как", "если", "когда", "где", "куда",
+        "но", "однако", "а также", "то есть", "причём", "притом",
+        "хотя", "пока", "поскольку",
+    ]
+    # Sort by length descending so "потому что" matches before "что"
+    comma_words.sort(key=len, reverse=True)
+
+    for word in comma_words:
+        # Add comma before the word if preceded by a non-punctuation char
+        pattern = rf"(\w)\s+({re.escape(word)})\b"
+        text = re.sub(
+            pattern,
+            lambda m: f"{m.group(1)}, {m.group(2)}",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+    # Sentence starters — put period before them and capitalize
     sentence_starters = [
-        "во-первых", "во-вторых", "в-третьих", "потом", "затем",
-        "также", "ещё", "далее", "кроме того", "наконец",
+        "во-первых", "во-вторых", "в-третьих",
+        "потом", "затем", "далее", "наконец",
     ]
     for word in sentence_starters:
-        pattern = rf"(\S)\s+({word})"
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            text = re.sub(
-                pattern,
-                lambda m: f"{m.group(1)}. {m.group(2)[0].upper()}{m.group(2)[1:]}",
-                text,
-                flags=re.IGNORECASE,
-            )
+        pattern = rf"(\w[,]?)\s+({re.escape(word)})\b"
+        text = re.sub(
+            pattern,
+            lambda m: f"{m.group(1)}. {m.group(2)[0].upper()}{m.group(2)[1:]}",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+    # Capitalize first letter
+    text = text[0].upper() + text[1:]
+
+    # Period at the end
+    if text[-1] not in ".!?":
+        text += "."
+
+    # Fix double punctuation
+    text = re.sub(r"[,]+", ",", text)
+    text = re.sub(r"[.]+", ".", text)
+    text = re.sub(r",\.", ".", text)
+
     return text
 
 
@@ -125,6 +164,7 @@ def main():
     all_text = []
 
     def on_exit(sig, frame):
+        global _prev_lines
         proc.terminate()
         proc.wait()
         final = json.loads(rec.FinalResult())
@@ -132,7 +172,12 @@ def main():
             all_text.append(final["text"])
         raw = " ".join(all_text)
         text = punctuate(raw) if use_punct else raw
-        clear_line()
+        # Clear preview
+        for _ in range(_prev_lines):
+            sys.stderr.write("\033[A\033[2K")
+        sys.stderr.write("\r\033[2K")
+        sys.stderr.flush()
+        _prev_lines = 0
         if text:
             print(text, flush=True)
             if copy_to_clipboard:
