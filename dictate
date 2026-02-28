@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""
+dictate-ru — offline голосовая диктовка на русском языке для Linux.
+Использует Vosk (offline STT) + PulseAudio (parec) + wl-copy (Wayland clipboard).
+
+Usage:
+  dictate        — говори, по Ctrl+C выводит текст и копирует в буфер обмена
+  dictate --no-copy  — только вывод в stdout, без копирования в буфер
+"""
+import subprocess
+import sys
+import json
+import signal
+import os
+import argparse
+
+DEFAULT_MODEL = "vosk-model-small-ru-0.22"
+MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip"
+SAMPLE_RATE = 16000
+CHUNK_SIZE = 8000
+
+os.environ["VOSK_LOG_LEVEL"] = "-1"
+
+
+def get_model_path():
+    """Find model in standard locations."""
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "model"),
+        os.path.expanduser(f"~/.local/share/vosk-models/{DEFAULT_MODEL}"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), DEFAULT_MODEL),
+    ]
+    for path in candidates:
+        if os.path.isdir(path) and os.path.isdir(os.path.join(path, "graph")):
+            return path
+    return None
+
+
+def download_model(dest_dir):
+    """Download and extract the Russian model."""
+    import zipfile
+    import urllib.request
+
+    zip_path = os.path.join(dest_dir, "model.zip")
+    print(f"Скачиваю модель ({DEFAULT_MODEL})...", file=sys.stderr, flush=True)
+
+    urllib.request.urlretrieve(MODEL_URL, zip_path)
+
+    print("Распаковываю...", file=sys.stderr, flush=True)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(dest_dir)
+    os.remove(zip_path)
+
+    extracted = os.path.join(dest_dir, DEFAULT_MODEL)
+    model_link = os.path.join(dest_dir, "model")
+    if os.path.isdir(extracted) and not os.path.exists(model_link):
+        os.symlink(extracted, model_link)
+
+    return extracted
+
+
+def check_dependencies():
+    """Check that required system tools are available."""
+    missing = []
+    for cmd in ["parec"]:
+        if not any(
+            os.access(os.path.join(p, cmd), os.X_OK)
+            for p in os.environ.get("PATH", "").split(":")
+        ):
+            missing.append(cmd)
+    if missing:
+        print(
+            f"Не найдены: {', '.join(missing)}\n"
+            f"Установи: sudo apt install pulseaudio-utils",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def has_wl_copy():
+    return any(
+        os.access(os.path.join(p, "wl-copy"), os.X_OK)
+        for p in os.environ.get("PATH", "").split(":")
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Offline голосовая диктовка на русском")
+    parser.add_argument("--no-copy", action="store_true", help="Не копировать в буфер обмена")
+    parser.add_argument("--model", type=str, help="Путь к Vosk модели")
+    args = parser.parse_args()
+
+    check_dependencies()
+
+    try:
+        from vosk import Model, KaldiRecognizer
+    except ImportError:
+        print("Vosk не установлен. Установи: pip install vosk", file=sys.stderr)
+        sys.exit(1)
+
+    model_path = args.model or get_model_path()
+    if not model_path:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = download_model(script_dir)
+
+    print("Загрузка...", end="", file=sys.stderr, flush=True)
+    model = Model(model_path)
+    rec = KaldiRecognizer(model, SAMPLE_RATE)
+    print(" Говори! (Ctrl+C — готово)", file=sys.stderr, flush=True)
+
+    proc = subprocess.Popen(
+        ["parec", "--format=s16le", f"--rate={SAMPLE_RATE}", "--channels=1", "--latency-msec=100"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+
+    copy_to_clipboard = not args.no_copy and has_wl_copy()
+    all_text = []
+
+    def on_exit(sig, frame):
+        proc.terminate()
+        proc.wait()
+        final = json.loads(rec.FinalResult())
+        if final.get("text"):
+            all_text.append(final["text"])
+        text = " ".join(all_text)
+        if text:
+            print(f"\n{text}", flush=True)
+            if copy_to_clipboard:
+                subprocess.run(["wl-copy", text], check=False)
+                print("(скопировано в буфер)", file=sys.stderr)
+        else:
+            print("\n(ничего не распознано)", file=sys.stderr)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, on_exit)
+    signal.signal(signal.SIGTERM, on_exit)
+
+    while True:
+        data = proc.stdout.read(CHUNK_SIZE)
+        if not data:
+            break
+
+        if rec.AcceptWaveform(data):
+            result = json.loads(rec.Result())
+            text = result.get("text", "")
+            if text:
+                all_text.append(text)
+                print(f"\r  {' '.join(all_text)}", end="", file=sys.stderr, flush=True)
+        else:
+            partial = json.loads(rec.PartialResult())
+            ptext = partial.get("partial", "")
+            if ptext:
+                preview = " ".join(all_text + [ptext]) if all_text else ptext
+                print(f"\r  {preview}   ", end="", file=sys.stderr, flush=True)
+
+
+if __name__ == "__main__":
+    main()
